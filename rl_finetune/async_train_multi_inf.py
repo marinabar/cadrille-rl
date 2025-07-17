@@ -190,8 +190,8 @@ def trainer_worker(queue, model, processor, config, rank):
                     rollout = {k: (v.to(rank) if isinstance(v, torch.Tensor) and not k=="avg_reward" else v)
                                 for k,v in mini_batches[i].items()}
                     # forward + backward on this micro‑batch
-                    loss = loss_fn(model=model, rollout_data=rollout).item() / num_reward_workers
-                    total_loss_in_iter += loss
+                    loss = loss_fn(model=model, rollout_data=rollout) / num_reward_workers
+                    total_loss_in_iter += loss.item()
                     # sum up gradients from two batches
                     loss.backward()
                 
