@@ -183,7 +183,6 @@ def trainer_worker(queue, model, processor, config, rank):
                 t0 = time.perf_counter()
                 optimizer.zero_grad()
                 total_loss_in_iter = 0
-                avg_reward = 0
                 # we want 2 “mini‑batches” before we step
                 for i in range(num_reward_workers):
                     # move tensors to GPU
