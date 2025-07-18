@@ -70,7 +70,7 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
         sampler.set_epoch(epoch)
 
         for batch in dataloader:
-            # synchronize the model parameters from GPU 1
+            # synchronize the model parameters from Trainer GPU 
             print(f"Generator (Rank {rank}): Synchronizing model parameters.")
 
             for param in model.parameters():
@@ -175,6 +175,7 @@ def trainer_worker(queue, model, processor, config, rank):
             if not mini_batches:
                 print(f"Trainer (Rank {rank}): Received {num_reward_workers} end-of-epoch signals.", flush=True)
                 continue
+
             # compute the average reward across that concatenated batch
             avg_reward = sum(avg_rewards) / len(avg_rewards)
 
@@ -183,7 +184,8 @@ def trainer_worker(queue, model, processor, config, rank):
                 t0 = time.perf_counter()
                 optimizer.zero_grad()
                 total_loss_in_iter = 0
-                # we want 2 “mini‑batches” before we step
+
+                #gradient accumulation
                 for i in range(num_reward_workers):
                     # move tensors to GPU
                     rollout = {k: (v.to(rank) if isinstance(v, torch.Tensor) and not k=="avg_reward" else v)
@@ -288,7 +290,6 @@ def spawn_main(config: TrainConfig):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "1245"
     
-    # 1) parse config exactly once
     world_size = config.num_reward_workers + 1
     spawn_ctx = mp.get_context("spawn")
     queue = spawn_ctx.Queue(maxsize=2*config.num_reward_workers )
