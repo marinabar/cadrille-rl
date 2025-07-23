@@ -136,7 +136,7 @@ def trainer_worker(queue, model, processor, config, rank):
     num_reward_workers = config.num_reward_workers
     
     experiment_config = ExperimentConfig(
-        auto_output_logging= "simple",
+        auto_output_logging= "False",
         auto_param_logging=True,
         auto_histogram_activation_logging=True
     )
@@ -147,7 +147,7 @@ def trainer_worker(queue, model, processor, config, rank):
         workspace="marinabar",
         experiment_config=experiment_config
     )
-
+    experiment.set_name(config.name)
     params = {k: getattr(config, k) for k in config.__annotations__}
     experiment.log_parameters(params)
 
