@@ -188,11 +188,11 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
             )
         #print(f"CD {cd} IoU {iou} AUC {auc} Mean Cos {mean_cos}", flush=True)
 
-
     except Exception as e:
         print(f"error for {base_file}: {e}", flush=True)
         pass
     #print(f"[TIME] metric computation without cadquery: {time.perf_counter()-t_cad:.3f}s on worker pid={os.getpid()}")
+    del gt_mesh, pred_mesh
     return dict(file_name=base_file, cd=cd, iou=iou, auc=auc, mean_cos=mean_cos)
 
 

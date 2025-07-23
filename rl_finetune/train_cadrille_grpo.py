@@ -38,9 +38,9 @@ class TrainConfig:
     train_mode: str = "img"
     train_file: str = "train_small.pkl"
     freeze_pc: bool = False
-    # GRPO params
     train_epochs: int = 20
     batch_size: int = 16
+    # GRPO params
     # how many outputs the old policy generates
     num_generations: int = 16
     # how many samples to choose for loss computation
@@ -56,6 +56,11 @@ class TrainConfig:
     use_buffer: bool = False
 
     num_reward_workers : int = 1
+
+    # reward params
+    iou_coef : int = 10
+    cd_coef : int = 0
+    auc_coef : int = 0
 
 
 def collate_img_pc_v1(batch, processor, n_points, eval=False):
@@ -123,7 +128,7 @@ def collate_img_pc_v1(batch, processor, n_points, eval=False):
     return inputs
 
 
-def get_reward_function(failure_reward):
+def get_reward_function(failure_reward, iou_coef=10, auc_coef=0, cd_coef=0):
     def combined_reward(completions, answer):
         torch.cuda.synchronize()
         # Get individual rewards
@@ -135,12 +140,14 @@ def get_reward_function(failure_reward):
         for m in pred_metrics:
             reward = 0
             iou = m["iou"] if m is not None else None
-            if iou is None:
+            auc =  m["auc"] if m is not None else None
+            cd =  m["cd"] if m is not None else None
+            if iou is None or auc is None or cd is None:
                 reward = failure_reward
             elif iou < 0:
                 reward = 0
             else:
-                reward = iou * 10
+                reward = iou * iou_coef + cd * cd_coef + auc * auc_coef
             rewards.append(reward)
         return rewards
     return combined_reward
