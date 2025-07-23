@@ -47,6 +47,9 @@ def compute_normals_metrics(pred_mesh, gt_mesh, tol=1, n_points=8192, visualize=
         valid_gt_points.append(gt_points[i])  # (3,)
         valid_pred_points.append(pred_points[idxs[best_idx]])  # (3,)
 
+    if len(valid_pred_normals) == 0:
+        return 1.0, 0.0, 100
+
     valid_gt_normals = np.vstack(valid_gt_normals)
     valid_pred_normals = np.vstack(valid_pred_normals)
     valid_gt_points = np.vstack(valid_gt_points)
@@ -56,8 +59,6 @@ def compute_normals_metrics(pred_mesh, gt_mesh, tol=1, n_points=8192, visualize=
     per_invalid = nb_invalid / n_points * 100
     #print(f"Number of points with no neighbors within tol: {nb_invalid} out of {n_points} ({per_invalid:.2f}%)")
 
-    if nb_invalid == n_points:
-        return 1.0, 0.0, 100
     
     
     # compute cosine similarity

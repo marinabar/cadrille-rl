@@ -4,10 +4,13 @@ import time
 
 os.environ["PYGLET_HEADLESS"] = "True"
 
-from multiprocessing import Process
 from multiprocessing.pool import Pool
-from multiprocessing import get_context
+from multiprocessing import get_context, TimeoutError,Process
 from functools import partial
+
+import numpy as np
+from tqdm import tqdm
+
 
 class NonDaemonProcess(Process):
     def _get_daemon(self):
@@ -25,30 +28,28 @@ class NonDaemonPool(Pool):
         proc.__class__ = NonDaemonProcess
         return proc
 
-# CAD recode imports
-import numpy as np
-from tqdm import tqdm
-
-import cadquery as cq
-import trimesh
-from scipy.spatial import cKDTree 
-from normal_consistency import compute_normals_metrics
-
 def init_worker():
     # runs exactly once per worker, before any tasks
-    import cadquery as cq
+
+    os.environ["OMP_NUM_THREADS"]       = "1"
+    os.environ["OPENBLAS_NUM_THREADS"]  = "1"
+    os.environ["MKL_NUM_THREADS"]       = "1"
+    
     import trimesh
     from scipy.spatial import cKDTree
 
     from normal_consistency import compute_normals_metrics
+    import cadquery as cq
 
     # make them available to your metric code
-    globals()['cq']      = cq
     globals()['trimesh'] = trimesh
     globals()['cKDTree'] = cKDTree
     globals()['compute_normals_metrics'] = compute_normals_metrics
+    globals()['cq'] = cq
 
 
+
+    
 def init_worker_fork():
     globals()['cq']      = cq
     globals()['trimesh'] = trimesh
@@ -140,6 +141,7 @@ def code_to_mesh_and_brep_less_safe(code_str, mesh_path, brep_path):
         print(f"Error executing CadQuery code : {e}")
         return None
 
+
 def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, n_points):
 
     gt_file = os.path.abspath(gt_file)
@@ -153,14 +155,18 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
 
     mesh_path = os.path.abspath(os.path.join(pred_mesh_dir, base_file + '.stl'))
     brep_path = os.path.abspath(os.path.join(pred_brep_dir, base_file + '.step'))
-
-    # runs the python code and saves the mesh and brep files
-    pred_mesh = code_to_mesh_and_brep_less_safe(text, mesh_path, brep_path)
+    
+    #t_cad = time.perf_counter()
+    try:
+        pred_mesh = code_to_mesh_and_brep_less_safe(text, mesh_path, brep_path)
+    except Exception as e:
+        return dict(file_name=base_file, cd=None, iou=None, auc=None, mean_cos=None)
+    #print(f"[TIME] cad_exec: {time.perf_counter()-t_cad:.3f}s on worker pid={os.getpid()}")
 
     if pred_mesh is None:
-        print("Skipping metrics: invalid prediction mesh", flush=True)
+        print("Skipping metrics: invalid prediction", flush=True)
         return dict(file_name=base_file, cd=None, iou=None, auc=None, mean_cos=None)
-
+    #t_met = time.perf_counter()
     cd, iou, auc, mean_cos = None, None, None, None
     try:  # apply_transform fails for some reason; or mesh path can not exist
         gt_mesh = trimesh.load_mesh(gt_file)
@@ -175,6 +181,7 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
         
 
         cd = compute_cd(gt_mesh, pred_mesh, n_points)
+
         iou = compute_iou(gt_mesh, pred_mesh)
         auc, mean_cos, _ = compute_normals_metrics(
                 pred_mesh, gt_mesh, tol=2
@@ -185,6 +192,7 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
     except Exception as e:
         print(f"error for {base_file}: {e}", flush=True)
         pass
+    #print(f"[TIME] metric computation without cadquery: {time.perf_counter()-t_cad:.3f}s on worker pid={os.getpid()}")
     return dict(file_name=base_file, cd=cd, iou=iou, auc=auc, mean_cos=mean_cos)
 
 
@@ -211,7 +219,7 @@ def init_pool(max_workers):
 
 
 def get_metrics_from_texts(texts, meshes, max_workers= None):
-
+    print(f"[POOL] POOL size={POOL._processes} pid={os.getpid()}")
     t0 = time.perf_counter()
     
     temp_path = "./tmp_data"
@@ -226,10 +234,14 @@ def get_metrics_from_texts(texts, meshes, max_workers= None):
         (text, gt, pred_mesh_path, pred_brep_path, n_points)
         for text, gt in zip(texts, meshes)
     ]
-    results = list(tqdm(
-            POOL.starmap(get_metrics_from_single_text, args),
-            total=len(texts)
-        ))
+    async_results = [POOL.apply_async(get_metrics_from_single_text, args=arg) for arg in args]
+    results = []
+    for res in async_results:
+        try:
+            results.append(res.get(timeout=60))
+        except TimeoutError:
+            print(f"[TIMEOUT] metrics task exceeded {60}s, skipping", flush=True)
+            results.append(dict(file_name=None, cd=None, iou=None, auc=None, mean_cos=None))
 
     wait = time.perf_counter() - t0 
     print(f"TIME to get metrics for {len(texts)} samples : {wait}")
@@ -239,7 +251,6 @@ def get_metrics_from_texts(texts, meshes, max_workers= None):
 
 
 def code_to_mesh_and_brep(code_str, mesh_path, brep_path):
-
 
     #print(f"executing code {code_str}")
     # saves mesh and brep files from code string 

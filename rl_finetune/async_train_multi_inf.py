@@ -8,7 +8,7 @@ from queue import Empty
 import time
 
 import pyrallis
-import wandb
+from comet_ml import start, ExperimentConfig
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -49,7 +49,7 @@ class IPCKeys:
 def reward_inference_worker(queue, model, processor, train_data, config, rank):
     print("Initialized Multiprocesssing pool")
     
-    init_pool(18)
+    init_pool(25)
 
 
     """GPU 0: sample rollouts, compute old log‑probs & advantages, enqueue minimal tensors."""
@@ -72,9 +72,10 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
         for batch in dataloader:
             # synchronize the model parameters from Trainer GPU 
             print(f"Generator (Rank {rank}): Synchronizing model parameters.")
-
-            for param in model.parameters():
-                dist.broadcast(param.data, src=config.num_reward_workers)
+            if step not in [0,1]:
+                print(f"Generating samples from 0 parameters")
+                for param in model.parameters():
+                    dist.broadcast(param.data, src=config.num_reward_workers)
 
             print(f"Generating rollouts for batch {step + 1}/{len(dataloader)}")
             rollout, avg_reward = generate_rollout_data(
@@ -121,7 +122,6 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
     
 
 def trainer_worker(queue, model, processor, config, rank):
-    from torch.nn.utils.rnn import pad_sequence
 
     """GPU 1: compute loss, update model, evaluate."""
     print(f"Starting Trainer (Rank {rank}) ")
@@ -135,18 +135,21 @@ def trainer_worker(queue, model, processor, config, rank):
 
     num_reward_workers = config.num_reward_workers
     
-    run = wandb.init(
-        project=config.project,
-        group=config.group,
-        name=config.name,
-        config=asdict(config),
+    experiment_config = ExperimentConfig(
+        auto_output_logging= "simple",
+        auto_param_logging=True,
+        auto_histogram_activation_logging=True
     )
 
-    os.environ["WANDB_RUN_ID"] = run.id
-    
-    # Initial broadcast of parameters
-    for param in model.parameters():
-        dist.broadcast(param.data, src=rank)
+    experiment = start(
+        api_key="CfQGtyWGF13CZEsUvXBeuPaSf",
+        project_name="cad",
+        workspace="marinabar",
+        experiment_config=experiment_config
+    )
+
+    params = {k: getattr(config, k) for k in config.__annotations__}
+    experiment.log_parameters(params)
 
     step = 0
     optimizer.zero_grad()
@@ -161,8 +164,8 @@ def trainer_worker(queue, model, processor, config, rank):
             while len(mini_batches) != num_reward_workers:
                 t0 = time.perf_counter()
                 item = queue.get()
-                wait = time.perf_counter() - t0 
-                print(f"TIME to get sample from queue {wait}", flush=True)
+                q_wait = time.perf_counter() - t0 
+                print(f"TIME to get sample from queue {q_wait}", flush=True)
                 if item is None:
                     print(f"Trainer (Rank {rank}): Received end-of-epoch signal from one worker.", flush=True)
                     end_signals += 1
@@ -179,6 +182,7 @@ def trainer_worker(queue, model, processor, config, rank):
             # compute the average reward across that concatenated batch
             avg_reward = sum(avg_rewards) / len(avg_rewards)
 
+            avg_loss = 0
             # parameter updates following the direction of the loss
             for grpo_iter in range(config.batch_updates):
                 t0 = time.perf_counter()
@@ -186,32 +190,38 @@ def trainer_worker(queue, model, processor, config, rank):
                 total_loss_in_iter = 0
 
                 #gradient accumulation
-                for i in range(num_reward_workers):
+                for i in range(len(mini_batches)):
                     # move tensors to GPU
                     rollout = {k: (v.to(rank) if isinstance(v, torch.Tensor) and not k=="avg_reward" else v)
                                 for k,v in mini_batches[i].items()}
                     # forward + backward on this micro‑batch
-                    loss = loss_fn(model=model, rollout_data=rollout) / num_reward_workers
+                    loss = loss_fn(model=model, rollout_data=rollout) / len(mini_batches)
                     total_loss_in_iter += loss.item()
                     # sum up gradients from two batches
                     loss.backward()
                 
                 wait = time.perf_counter() - t0 
-                print(f"TIME to run 3 GRPO iterations on 2 mini batches{wait}", flush=True)
+                print(f"TIME to run 1 GRPO iterations on {num_reward_workers} mini batches {wait}", flush=True)
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
                 optimizer.step()
 
-                avg_loss_this_iter = total_loss_in_iter
-                print(f"Trainer (Rank {rank}): Epoch {epoch+1}, Step {step+1}, GRPO Iter {grpo_iter+1}/{config.batch_updates}, Loss: {avg_loss_this_iter:.4f}", flush=True)
-                wandb.log({
-                    "loss": avg_loss_this_iter,
-                    "step": step,
+                avg_loss += total_loss_in_iter
+                print(f"Trainer (Rank {rank}): Epoch {epoch+1}, Step {step+1}, GRPO Iter {grpo_iter+1}/{config.batch_updates}, Loss: {total_loss_in_iter:.4f}", flush=True)
+                experiment.log_metrics({
+                    "loss": total_loss_in_iter,
+                    "step": step +1,
                     "grpo_iter": grpo_iter + 1,
                     "epoch": epoch + 1,
+                    "grad_norm": norm.item(),
+                    "time/iter_s": wait,
                 })
             
-            wandb.log({"average_reward": avg_reward, "step": step, "epoch": epoch + 1})
+            experiment.log_metrics({"average_reward": avg_reward, "step": step+1, "epoch": epoch + 1, 
+                    "time/queue_s": q_wait, 
+                    "mean_advantage_0": mini_batches[0][IPCKeys.ADV].mean().item(),
+                    "loss_avg": avg_loss / config.batch_updates
+                    })
 
             t0 = time.perf_counter()
             for p in model.parameters():
@@ -227,7 +237,7 @@ def trainer_worker(queue, model, processor, config, rank):
 
 
     if rank == num_reward_workers:
-        wandb.finish()
+        experiment.end()
     return
 
 
@@ -301,5 +311,5 @@ def spawn_main(config: TrainConfig):
     )
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5"
     spawn_main()
