@@ -123,6 +123,7 @@ def generate_rollout_data(model, reward_function,
         print(f"[TIME] generation time: {gen_time:.3f} s", flush=True)
 
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        print(f"[DATA] input_ids shape: {input_ids.shape}", flush=True)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
@@ -139,7 +140,7 @@ def generate_rollout_data(model, reward_function,
         )
         reward_time = time.perf_counter() - t1
         print(f"[TIME] reward computation time: {reward_time:.3f} s", flush=True)
-        #print("Rewards", rewards, flush=True)
+        print("Rewards", rewards, flush=True)
 
         batch_size = len(prompts['input_ids'])
         num_generations = num_generations

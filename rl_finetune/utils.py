@@ -1,24 +1,19 @@
 import os
 import time
 
-
 os.environ["PYGLET_HEADLESS"] = "True"
 
 from multiprocessing.pool import Pool
-from multiprocessing import get_context, TimeoutError,Process
-from functools import partial
+from multiprocessing import TimeoutError, Process
 
 import numpy as np
-from tqdm import tqdm
 
 
 class NonDaemonProcess(Process):
     def _get_daemon(self):
         return False
-
     def _set_daemon(self, value):
         pass
-
     daemon = property(_get_daemon, _set_daemon)
 
 
@@ -28,9 +23,8 @@ class NonDaemonPool(Pool):
         proc.__class__ = NonDaemonProcess
         return proc
 
+# process initializer used in case of forkserver
 def init_worker():
-    # runs exactly once per worker, before any tasks
-
     os.environ["OMP_NUM_THREADS"]       = "1"
     os.environ["OPENBLAS_NUM_THREADS"]  = "1"
     os.environ["MKL_NUM_THREADS"]       = "1"
@@ -48,8 +42,7 @@ def init_worker():
     globals()['cq'] = cq
 
 
-
-    
+# process initiaizer used in case of forking the main process, do not use with CUDA
 def init_worker_fork():
     globals()['cq']      = cq
     globals()['trimesh'] = trimesh
@@ -82,10 +75,6 @@ def compute_cd(pred_mesh, gt_mesh, n_points=8192):
     pred_distance, _ = cKDTree(pred_points).query(gt_points, k=1)
     cd = np.mean(np.square(gt_distance)) + np.mean(np.square(pred_distance))
     return cd
-
-
-def compute_metrics(pred_mesh, gt_mesh):
-    return compute_cd(pred_mesh, gt_mesh), compute_iou(pred_mesh, gt_mesh)
 
 
 
@@ -158,6 +147,7 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
     
     #t_cad = time.perf_counter()
     try:
+        # execute cadquery code
         pred_mesh = code_to_mesh_and_brep_less_safe(text, mesh_path, brep_path)
     except Exception as e:
         return dict(file_name=base_file, cd=None, iou=None, auc=None, mean_cos=None)
@@ -168,7 +158,7 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
         return dict(file_name=base_file, cd=None, iou=None, auc=None, mean_cos=None)
     #t_met = time.perf_counter()
     cd, iou, auc, mean_cos = None, None, None, None
-    try:  # apply_transform fails for some reason; or mesh path can not exist
+    try: 
         gt_mesh = trimesh.load_mesh(gt_file)
 
         gt_mesh = transform_gt_mesh(gt_mesh)
@@ -191,7 +181,9 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
     except Exception as e:
         print(f"error for {base_file}: {e}", flush=True)
         pass
+
     #print(f"[TIME] metric computation without cadquery: {time.perf_counter()-t_cad:.3f}s on worker pid={os.getpid()}")
+
     del gt_mesh, pred_mesh
     return dict(file_name=base_file, cd=cd, iou=iou, auc=auc, mean_cos=mean_cos)
 
@@ -221,7 +213,8 @@ def init_pool(max_workers):
 def get_metrics_from_texts(texts, meshes, max_workers= None):
     print(f"[POOL] POOL size={POOL._processes} pid={os.getpid()}")
     t0 = time.perf_counter()
-    
+
+    # variables used in the case of mesh export
     temp_path = "./tmp_data"
     pred_mesh_path = os.path.join(temp_path, 'tmp_mesh')
     pred_brep_path = os.path.join(temp_path, 'tmp_brep')
@@ -247,22 +240,3 @@ def get_metrics_from_texts(texts, meshes, max_workers= None):
     print(f"TIME to get metrics for {len(texts)} samples : {wait}")
 
     return results
-########## evaluate functions ##########
-
-
-def code_to_mesh_and_brep(code_str, mesh_path, brep_path):
-
-    #print(f"executing code {code_str}")
-    # saves mesh and brep files from code string 
-    try:
-        ns = safe_ns.copy()
-        exec(code_str, ns)
-        compound = ns['r'].val()
-        mesh = compound_to_mesh(compound)
-        assert len(mesh.faces) > 2
-        mesh.export(mesh_path)
-        print("mesh exported successfully")
-        # cq.exporters.export(compound, brep_path)
-    except Exception as e:
-        print("error executing the python code and exporting the mesh:", e)
-        return

@@ -256,6 +256,7 @@ class RealDPODataset(Dataset):
         item['ious'] = ious
         return item
 
+import dataset_utils as du
 
 class RealDatasetMM(Dataset):
     def __init__(self, path, file_name, n_points=256, mode='pc',
@@ -344,7 +345,7 @@ class RealDatasetMM(Dataset):
 
     def get_point_cloud(self, mesh):
         mesh = self._augment_pc(mesh)
-        point_cloud = mesh_to_point_cloud(mesh, self.n_points)
+        point_cloud = du.mesh_to_point_cloud(mesh, self.n_points)
 
         input_item = {
             'point_cloud': point_cloud,
