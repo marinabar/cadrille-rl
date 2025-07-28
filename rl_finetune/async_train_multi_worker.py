@@ -1,13 +1,18 @@
+import faulthandler, sys, signal
+faulthandler.enable(file=sys.stderr, all_threads=True)
 import os
 from dataclasses import asdict, dataclass
 from functools import partial
 from queue import Empty
 
 import time
-
-os.environ["OMP_NUM_THREADS"]       = "1"
 os.environ["OPENBLAS_NUM_THREADS"]  = "1"
+
+"""
+os.environ["OMP_NUM_THREADS"]       = "1"
 os.environ["MKL_NUM_THREADS"]       = "1"
+"""
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
     "max_split_size_mb:128,"
     "roundup_power2_divisions:16,"
@@ -23,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.multiprocessing as mp
 
-from utils import init_pool
+from utils_async import init_pool
 
 
 from grpo_mm import generate_rollout_data, grpo_loss
@@ -70,7 +75,7 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
     #model.config.use_cache = False
 
     print("Initializing Multiprocesssing pool")
-    init_pool(6)
+    init_pool(4)
 
     torch.cuda.set_device(rank)
 
@@ -81,8 +86,9 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
     step = 0
 
     #start_batch = 80
+    #ctx = mp.get_context('spawn')
     dataloader = DataLoader(train_data, batch_size=config.batch_size // config.num_reward_workers, collate_fn=partial(collate_img_pc_v1, processor=processor, n_points=256), sampler=sampler,
-                                num_workers=4, )
+                                num_workers=0)
 
     print(f"Datalaoder len : {len(dataloader)}")
 
@@ -104,12 +110,14 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
         for i, batch in enumerate(dataloader):
             # synchronize the model parameters from Trainer GPU 
             print(f"Generator (Rank {rank}): Synchronizing model parameters.")
-
+            t0 = time.perf_counter()
             if step > -1 :
                 dist.recv(flat, src=config.num_reward_workers)
                 with torch.no_grad():
                     torch.nn.utils.vector_to_parameters(flat, sync_list)
-            mem_before = torch.cuda.memory_allocated(rank) / 1024**3
+            p_wait = time.perf_counter() - t0 
+            print(f"TIME to receive parameters from Trainer : {p_wait} to rank {rank}")
+
 
             print(f"Generator (Rank {rank}) Generating rollouts for batch {step + 1}/{len(dataloader)}")
             torch.cuda.empty_cache()
@@ -125,12 +133,6 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
                 top_samples=config.top_samples,
                 gpg=config.use_gpg,
                 buffer = None)
-            
-            mem_after = torch.cuda.memory_allocated(rank) / 1024**3
-            
-            print(f"Rank {rank}, Step {step}: "
-                f"Mem: {mem_before:.2f}GB -> {mem_after:.2f}GB, "
-                f"Fragmentation: {torch.cuda.memory_reserved(rank) - torch.cuda.memory_allocated(rank)}")
             
         
             payload = {} 
@@ -166,7 +168,6 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
 
         # Signal to trainer that the epoch is finished
         queue.put({IPCKeys.END_EPOCH: True, IPCKeys.RANK: rank})
-
     print(f"Generator (Rank {rank}): All epochs complete.")
     
 
@@ -209,6 +210,8 @@ def trainer_worker(queue, model, processor, config, rank):
         for dst in range(config.num_reward_workers):
             dist.send(flat, dst=dst)
 
+    skip_iters = 2
+    skip_counter = 0
 
     for epoch in range(config.train_epochs):
 
@@ -218,15 +221,29 @@ def trainer_worker(queue, model, processor, config, rank):
         # Process training steps until all workers finish the epoch
         while True:
             # Collect mini-batches from all currently alive workers
-            print(f"Trainer torch.cuda.memory_stats() : {torch.cuda.memory_stats()}")
+            print(f"Trainer torch.cuda.memory_stats() : {torch.cuda.memory_stats()}\n")
+            print(f"Trainer torch.cuda.memory_summary() : {torch.cuda.memory_summary(abbreviated=False)}")
+
             mini_batches = []
             avg_rewards = []
             alive_workers = alive(done)
-            
+
+            nb_waits = 0
+
             if not alive_workers:
                 print(f"Trainer (Rank {rank}): No alive workers remaining.")
                 break
-                
+
+            if skip_counter > 0:
+                print(f"Trainer : Skipping parameter broadcast to Reward workers skip iteration {skip_counter} iterations remaining")
+                flat = torch.nn.utils.parameters_to_vector(sync_list).detach()
+                for dst in alive_workers: 
+                    dist.send(flat, dst)
+                skip_counter -= 1
+                step+=1
+                continue
+
+
             print(f"Trainer (Rank {rank}): Collecting data from {len(alive_workers)} alive workers")
             workers_responded = set()
             while len(mini_batches) + end_signals_received < len(alive_workers):
@@ -246,6 +263,12 @@ def trainer_worker(queue, model, processor, config, rank):
 
                 q_wait = time.perf_counter() - t0 
                 print(f"TIME to get sample from queue {q_wait}")
+                if q_wait > 2:
+                    nb_waits +=1
+
+                if nb_waits == len(alive_workers):
+                    skip_counter = skip_iters
+                    break
 
                 worker_rank = item.get(IPCKeys.RANK)
 
@@ -274,6 +297,10 @@ def trainer_worker(queue, model, processor, config, rank):
             if end_signals_received >= len(alive_workers):
                 print(f"Trainer (Rank {rank}): Received all {end_signals_received} end-of-epoch signals for epoch {epoch + 1}")
                 break
+            
+            if skip_counter > 0:
+                continue
+            
 
             if mini_batches:
                 # compute the average reward across that concatenated batch
@@ -311,7 +338,8 @@ def trainer_worker(queue, model, processor, config, rank):
                         "epoch": epoch + 1,
                         "grad_norm": norm.item(),
                         "time/iter_s": wait,
-                    }, step = step)
+                        "step":step,
+                    })
 
                 experiment.log_metrics({"average_reward": avg_reward, "epoch": epoch + 1, 
                         "time/queue_s": q_wait, 
@@ -321,8 +349,6 @@ def trainer_worker(queue, model, processor, config, rank):
 
 
             t0 = time.perf_counter()
-            #for p in model.parameters():
-                #dist.broadcast(p.data, src=rank)
             flat = torch.nn.utils.parameters_to_vector(sync_list).detach()
             workers_with_data = {mb[IPCKeys.RANK] for mb in mini_batches}
             for dst in workers_with_data:
@@ -403,6 +429,7 @@ def main(
         trainer_worker(
             queue, model, processor, config, rank,
         )
+    dist.barrier()
     cleanup()
     print("Training completed.")
 
@@ -410,8 +437,8 @@ def main(
 def spawn_main(config: TrainConfig):
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "1245"
-    #os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+    os.environ["MASTER_PORT"] = "1240"
+    #os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
     
     world_size = config.num_reward_workers + 1
     spawn_ctx = mp.get_context("spawn")

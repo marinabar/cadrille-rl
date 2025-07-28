@@ -18,7 +18,7 @@ from transformers import AutoProcessor
 
 from dataset_utils import RealDatasetMM
 #from grpo_mm import train_with_grpo_mm
-from utils import get_metrics_from_texts
+from utils_async import get_metrics_from_texts
 
 os.environ["PYGLET_HEADLESS"] = "True"
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
@@ -140,14 +140,14 @@ def get_reward_function(failure_reward, iou_coef=10, auc_coef=0, cd_coef=0):
         for m in pred_metrics:
             reward = 0
             iou = m["iou"] if m is not None else None
-            auc =  m["auc"] if m is not None else None
+            #auc =  m["auc"] if m is not None else None
             cd =  m["cd"] if m is not None else None
-            if iou is None or auc is None or cd is None:
+            if iou is None or cd is None:
                 reward = failure_reward
             elif iou < 0:
                 reward = 0
             else:
-                reward = iou * iou_coef + cd * cd_coef + auc * auc_coef
+                reward = iou * iou_coef + np.clip(1 - cd * 1000, 0, 1) * cd_coef
             rewards.append(reward)
         return rewards
     return combined_reward
