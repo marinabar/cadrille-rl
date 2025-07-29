@@ -31,7 +31,7 @@ import torch.multiprocessing as mp
 from utils_async import init_pool
 
 
-from grpo_mm import generate_rollout_data, grpo_loss
+from grpo_mm import generate_rollout_data, grpo_loss, gspo_loss
 from train_cadrille_grpo import TrainConfig, collate_img_pc_v1, get_reward_function, optimize_model_memory, setup, cleanup
 
 from cad_recode_model_mm import Cadrille
@@ -75,7 +75,7 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
     #model.config.use_cache = False
 
     print("Initializing Multiprocesssing pool")
-    init_pool(4)
+    init_pool(config.pool_size)
 
     torch.cuda.set_device(rank)
 
@@ -88,7 +88,7 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
     #start_batch = 80
     #ctx = mp.get_context('spawn')
     dataloader = DataLoader(train_data, batch_size=config.batch_size // config.num_reward_workers, collate_fn=partial(collate_img_pc_v1, processor=processor, n_points=256), sampler=sampler,
-                                num_workers=0)
+                                num_workers=config.dataloader_workers)
 
     print(f"Datalaoder len : {len(dataloader)}")
 
@@ -161,7 +161,11 @@ def reward_inference_worker(queue, model, processor, train_data, config, rank):
             if epoch == (config.train_epochs - 1) and i == (len(dataloader) - 1):
                 print(f"Sending end of training signal by Generator {rank}")
                 payload[IPCKeys.DONE] = True
-            queue.put(payload)
+            try:
+                queue.put(payload, timeout=320)
+            except queue.Full:
+                print(f"[Rank {rank}] Queue is actually FULL (size: {queue.qsize()})")
+                continue
 
             step+=1
 
@@ -180,7 +184,8 @@ def trainer_worker(queue, model, processor, config, rank):
 
 
     reward_function = get_reward_function(config.failure_reward)
-    loss_fn = partial(grpo_loss, processor=processor,epsilon_high=config.epsilon_high, epsilon_low=config.epsilon_low, reward_function=reward_function)
+    rl_loss = grpo_loss if not config.use_gspo else gspo_loss
+    loss_fn = partial(rl_loss, processor=processor,epsilon_high=config.epsilon_high, epsilon_low=config.epsilon_low, reward_function=reward_function)
 
     num_reward_workers = config.num_reward_workers
     done = [False] * config.num_reward_workers
@@ -221,7 +226,6 @@ def trainer_worker(queue, model, processor, config, rank):
         # Process training steps until all workers finish the epoch
         while True:
             # Collect mini-batches from all currently alive workers
-            print(f"Trainer torch.cuda.memory_stats() : {torch.cuda.memory_stats()}\n")
             print(f"Trainer torch.cuda.memory_summary() : {torch.cuda.memory_summary(abbreviated=False)}")
 
             mini_batches = []
@@ -244,7 +248,7 @@ def trainer_worker(queue, model, processor, config, rank):
                 continue
 
 
-            print(f"Trainer (Rank {rank}): Collecting data from {len(alive_workers)} alive workers")
+            #print(f"Trainer (Rank {rank}): Collecting data from {len(alive_workers)} alive workers")
             workers_responded = set()
             while len(mini_batches) + end_signals_received < len(alive_workers):
                 t0 = time.perf_counter()
@@ -325,7 +329,7 @@ def trainer_worker(queue, model, processor, config, rank):
                         loss.backward()
                     
                     wait = time.perf_counter() - t0 
-                    print(f"TIME to run 1 GRPO iterations on {num_reward_workers} mini batches {wait}")
+                    #print(f"TIME to run 1 GRPO iterations on {num_reward_workers} mini batches {wait}")
 
                     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
                     optimizer.step()
@@ -361,8 +365,11 @@ def trainer_worker(queue, model, processor, config, rank):
 
             step += 1
 
-            if mini_batches:
-                del mini_batches
+
+            if step == 3000 // (config.batch_size * 2) :
+                model.save_pretrained(f"{config.save_path}/{config.name}_{epoch}_mid")
+                processor.save_pretrained(f"{config.save_path}/{config.name}_{epoch}_mid")
+
             torch.cuda.empty_cache()
 
         print("Emptying cuda cache and saving model")

@@ -53,9 +53,12 @@ class TrainConfig:
     epsilon_low: float = 0.1
 
     use_gpg: bool = False
+    use_gspo: bool = False
     use_buffer: bool = False
 
     num_reward_workers : int = 1
+    pool_size : int = 4
+    dataloader_workers : int = 4
 
     # reward params
     iou_coef : int = 10

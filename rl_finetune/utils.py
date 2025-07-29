@@ -41,13 +41,13 @@ def init_worker():
     globals()['compute_normals_metrics'] = compute_normals_metrics
     globals()['cq'] = cq
 
-
+"""
 # process initiaizer used in case of forking the main process, do not use with CUDA
 def init_worker_fork():
     globals()['cq']      = cq
     globals()['trimesh'] = trimesh
     globals()['cKDTree'] = cKDTree
-    globals()['compute_normals_metrics'] = compute_normals_metrics
+    globals()['compute_normals_metrics'] = compute_normals_metrics"""
 
 
 def compute_iou(gt_mesh, pred_mesh):
@@ -116,7 +116,7 @@ def compound_to_mesh(compound):
     return trimesh.Trimesh([(v.x, v.y, v.z) for v in vertices], faces)
 
 
-def code_to_mesh_and_brep_less_safe(code_str, mesh_path, brep_path):
+def code_to_mesh_and_brep_less_safe(code_str):
     safe_ns = {"cq": cq}
     ns=safe_ns.copy()
     #print(f"Executing code {code_str}")
@@ -131,24 +131,17 @@ def code_to_mesh_and_brep_less_safe(code_str, mesh_path, brep_path):
         return None
 
 
-def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, n_points):
+def get_metrics_from_single_text(text, gt_file, n_points):
 
     gt_file = os.path.abspath(gt_file)
-    pred_mesh_dir = os.path.abspath(pred_mesh_path)
-    pred_brep_dir = os.path.abspath(pred_brep_path)
-
     base_file = os.path.basename(gt_file).rsplit('.stl', 1)[0]
 
     #print(f"computing metrics for file: {gt_file}", flush=True)
-    #print(f"saving temp mesh to: {pred_mesh_dir}", flush=True)
-
-    mesh_path = os.path.abspath(os.path.join(pred_mesh_dir, base_file + '.stl'))
-    brep_path = os.path.abspath(os.path.join(pred_brep_dir, base_file + '.step'))
     
     #t_cad = time.perf_counter()
     try:
         # execute cadquery code
-        pred_mesh = code_to_mesh_and_brep_less_safe(text, mesh_path, brep_path)
+        pred_mesh = code_to_mesh_and_brep_less_safe(text)
     except Exception as e:
         return dict(file_name=base_file, cd=None, iou=None, auc=None, mean_cos=None)
     #print(f"[TIME] cad_exec: {time.perf_counter()-t_cad:.3f}s on worker pid={os.getpid()}")
@@ -183,8 +176,14 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
         pass
 
     #print(f"[TIME] metric computation without cadquery: {time.perf_counter()-t_cad:.3f}s on worker pid={os.getpid()}")
-
-    del gt_mesh, pred_mesh
+    finally:
+        try:
+            if gt_mesh is not None:
+                del gt_mesh
+            if pred_mesh is not None:
+                del pred_mesh
+        except:
+            pass
     return dict(file_name=base_file, cd=cd, iou=iou, auc=auc, mean_cos=mean_cos)
 
 
@@ -193,7 +192,7 @@ def get_metrics_from_single_text(text, gt_file, pred_mesh_path, pred_brep_path, 
 POOL = None
 
 def init_pool(max_workers):
-    print("Initializing POOOL", flush=True)
+    print("Initializing POOL", flush=True)
     global POOL
     if POOL is None:
         from multiprocessing import get_context
@@ -215,16 +214,10 @@ def get_metrics_from_texts(texts, meshes, max_workers= None):
     t0 = time.perf_counter()
 
     # variables used in the case of mesh export
-    temp_path = "./tmp_data"
-    pred_mesh_path = os.path.join(temp_path, 'tmp_mesh')
-    pred_brep_path = os.path.join(temp_path, 'tmp_brep')
-
-    os.makedirs(pred_mesh_path, exist_ok=True)
-    os.makedirs(pred_brep_path, exist_ok=True)
 
     n_points = 8192
     args = [
-        (text, gt, pred_mesh_path, pred_brep_path, n_points)
+        (text, gt, n_points)
         for text, gt in zip(texts, meshes)
     ]
     async_results = [POOL.apply_async(get_metrics_from_single_text, args=arg) for arg in args]

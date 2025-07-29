@@ -251,6 +251,38 @@ def gpg_loss(model, rollout_data, tokenizer, reward_function, epsilon_high=0.2, 
     return loss
 
 
+def gspo_loss(model, rollout_data, processor, reward_function, epsilon_high=0.2, epsilon_low=0.2, top_samples=None):
+    """
+    Computes the GRPO loss for updating the policy model. GSPO update source : TRL by Hugging Face
+    """
+    device = model.device
+    input_ids = rollout_data["input_ids"]
+    point_cloud = rollout_data["point_cloud"]
+    attention_mask = rollout_data["attention_mask"]
+    completion_mask = rollout_data["completion_mask"]
+    logits_to_keep = rollout_data["logits_to_keep"]
+    old_log_probs = rollout_data["old_log_probs"]
+    advantages = rollout_data["advantages"]
+    is_pc = rollout_data["is_pc"]
+    is_img = rollout_data["is_img"]
+    pixel_values_videos = rollout_data["pixel_values_videos"]
+    video_grid_thw = rollout_data["video_grid_thw"]
+    token_log_probs = compute_log_probs(model, (input_ids.clone(), attention_mask.clone(), point_cloud.clone(), is_pc.clone(), is_img.clone(), pixel_values_videos, video_grid_thw), logits_to_keep)
+    log_ratio = token_log_probs - old_log_probs
+    log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1)
+    log_importance_weights = log_importance_weights.unsqueeze(-1)
+    #log_importance_weights : (B, 1)
+    ratio = torch.exp(log_importance_weights)
+
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - epsilon_low, 1 + epsilon_high) * advantages
+    surrogate_loss = torch.min(surr1, surr2)
+    per_token_loss = surrogate_loss
+    loss = -torch.clamp(torch.nan_to_num(((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)), 0, 0,
+                             0), min=-10, max=10).mean()
+    return loss
+    
+
 def merge_collated_batches(batch1, batch2, padding_value):
     merged = {}
     bs1 = batch1['input_ids'].shape[0]
