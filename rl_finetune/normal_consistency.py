@@ -1,11 +1,4 @@
-from scipy.spatial import cKDTree
-import trimesh
-import numpy as np
-import os
-import torch
-
-
-def compute_normals_metrics(pred_mesh, gt_mesh, tol=1, n_points=8192, visualize=False):
+def compute_normals_metrics(gt_mesh, pred_mesh, tol=1, n_points=8192, visualize=False):
     """
     Input : normalized meshes
     computes the cosine similarity between the normals of the predicted mesh and the ground truth mesh.
@@ -96,6 +89,7 @@ def compute_normals_metrics(pred_mesh, gt_mesh, tol=1, n_points=8192, visualize=
     return auc_normalized, mean_cos_sim, per_invalid
 
 def save_normals(pred_normals, gt_normals, pred_points, gt_points):
+    import os
     import matplotlib.pyplot as plt
     os.makedirs('plots', exist_ok=True)
 

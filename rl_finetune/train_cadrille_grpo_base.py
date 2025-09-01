@@ -18,7 +18,7 @@ from transformers import AutoProcessor
 
 from dataset_utils import RealDatasetMM
 #from grpo_mm import train_with_grpo_mm
-from utils_async import get_metrics_from_texts
+from utils_cadrille import get_metrics_from_texts
 
 
 os.environ["PYGLET_HEADLESS"] = "True"
@@ -45,10 +45,10 @@ class TrainConfig:
     save_mid_epoch: bool = True
 
     epoch_save: int = 1
-    
-    temperature: float = 1.0
     do_sample: bool = False
     top_p: float = 1.0
+    
+    temperature: float = 1.0
     # GRPO params
     # how many outputs the old policy generates
     num_generations: int = 16
@@ -103,7 +103,6 @@ def collate_img_pc_v1(batch, processor, n_points, eval=False):
         messages.append(message)
     texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
              for msg in messages]
-
     points_inputs = ''.join(n_points * [processor.tokenizer.pad_token])
 
     for i in range(len(texts)):
@@ -138,6 +137,7 @@ def collate_img_pc_v1(batch, processor, n_points, eval=False):
     inputs['mesh_path'] = [m['mesh_path'] for m in batch]
     inputs['mesh'] = [m['mesh'] for m in batch]
     inputs['idx'] = [m['idx'] for m in batch]
+    print(f"input meshes paths {inputs['mesh_path']}")
     return inputs
 
 
@@ -153,17 +153,16 @@ def get_reward_function(failure_reward, iou_coef=10, auc_coef=0, cd_coef=0):
         for m in pred_metrics:
             reward = 0
             iou = m["iou"] if m is not None else None
-            #auc =  m["auc"] if m is not None else None
+            auc =  m["auc"] if m is not None else None
             cd =  m["cd"] if m is not None else None
-            if iou is None:
+            if iou is None or cd is None:
                 reward = failure_reward
-            #elif iou < 0:
-            #    reward = 0
+            elif iou < 0:
+                reward = 0
             else:
-                #print(f"Chamfer Distance: {cd}")
-                #reward = np.clip(1 - cd * 5, 0, 1) * cd_coef
-                #reward = np.clip(-1/6 * np.log10(cd), 0, 1) * cd_coef
-                reward = iou * iou_coef + np.clip(1 - cd * 1000, 0, 1) * cd_coef
+                reward = iou * iou_coef
+                #np.clip(-1/6 * np.log10(cd), 0, 1) * cd_coef + (np.clip((10 * auc - 4) / 6, 0, 1)) * auc_coef
+                # auc is in 0,5
             rewards.append(reward)
         return rewards
     return combined_reward
