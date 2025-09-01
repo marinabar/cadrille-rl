@@ -58,7 +58,7 @@ def create_completion_mask(completion_ids, eos_token_id):
     return (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
 
-def generate_completions(model, processor, inputs, num_generations=4, max_completion_length=32):
+def generate_completions(model, processor, inputs, num_generations=4, max_completion_length=32, temperature=1.0, top_p=1.0, do_sample=False):
     """
     Generates multiple completions for each prompt.
     """
@@ -94,11 +94,15 @@ def generate_completions(model, processor, inputs, num_generations=4, max_comple
                              video_grid_thw=video_grid_thw.clone() if video_grid_thw is not None else None,
                              max_new_tokens=max_completion_length,
                              do_sample=True,
-                             temperature=1.0,
-                             top_p=1.0,
+                             temperature=temperature,
+                             top_p=top_p,
                              top_k=50,
                              early_stopping=False,
-                             bad_words_ids=[[model.config.video_token_id]],
+                             bad_words_ids=[
+                                        [model.config.image_token_id],
+                                        [model.config.video_token_id],
+                                        [model.config.vision_start_token_id],
+                                        [model.config.vision_end_token_id],]
                              )
     completion_ids = outputs[:, prompt_length:]
     completion_mask = create_completion_mask(completion_ids, processor.tokenizer.eos_token_id)
@@ -108,7 +112,7 @@ def generate_completions(model, processor, inputs, num_generations=4, max_comple
 
 def generate_rollout_data(model, reward_function,
                           processor, batch_samples, num_generations, max_completion_length, top_samples=None,
-                          gpg=False, buffer=None):
+                          gpg=False, buffer=None, temperature=1.0, top_p=1.0, do_sample=False):
     """
     Generates data for GRPO rollouts including completions and log probabilities.
     """
@@ -116,14 +120,13 @@ def generate_rollout_data(model, reward_function,
     with torch.no_grad():
         t0 = time.perf_counter()
         point_cloud, prompt_ids, prompt_mask, is_pc, is_img, pixel_values_videos, video_grid_thw, completion_ids, completion_mask = generate_completions(
-            model, processor, prompts, num_generations, max_completion_length
+            model, processor, prompts, num_generations, max_completion_length, temperature, do_sample, top_p
         )
 
         gen_time = time.perf_counter() - t0
         print(f"[TIME] generation time: {gen_time:.3f} s", flush=True)
 
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        print(f"[DATA] input_ids shape: {input_ids.shape}", flush=True)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
@@ -151,17 +154,14 @@ def generate_rollout_data(model, reward_function,
         print("Average Reward:", avg_reward, flush=True)
         mean_rewards = rewards.mean(dim=1).repeat_interleave(num_generations)
 
-        if buffer:
-            # Expand buffer
-            buffer_expand_size = batch_size // 2
-            std_rewards = rewards.std(dim=1).view(-1)
-            std_vals, std_indices = torch.topk(std_rewards, buffer_expand_size)
-            dataset_indices = [batch_samples['idx'][int(i)] for i in std_indices]
-            buffer.add_many(dataset_indices)
-
         abs_adv = torch.abs(rewards - mean_rewards.view(batch_size, num_generations))
+        #adv = rewards - mean_rewards.view(batch_size, num_generations)
         # gets the indices of the top samples based on absolute advantages
+
         _, top_indices = torch.topk(abs_adv, top_samples, dim=1)
+        #_, top_indices = torch.topk(adv, top_samples, dim=1)
+        #print("NOT using absolute advantages for GRPO loss")
+
 
         row_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, top_samples).to(model.device)
         flattened_indices = row_indices * num_generations + top_indices
@@ -204,7 +204,7 @@ def generate_rollout_data(model, reward_function,
     return result, avg_reward
 
 
-def grpo_loss(model, rollout_data, processor, reward_function, epsilon_high=0.2, epsilon_low=0.2, top_samples=None):
+def grpo_loss(model, rollout_data, processor, reward_function, epsilon_high=0.2, epsilon_low=0.2, top_samples=None, logger=None):
     """
     Computes the GRPO loss for updating the policy model.
     """
@@ -222,13 +222,87 @@ def grpo_loss(model, rollout_data, processor, reward_function, epsilon_high=0.2,
     video_grid_thw = rollout_data["video_grid_thw"]
     token_log_probs = compute_log_probs(model, (input_ids.clone(), attention_mask.clone(), point_cloud.clone(), is_pc.clone(), is_img.clone(), pixel_values_videos, video_grid_thw), logits_to_keep)
     ratio = torch.exp(token_log_probs - old_log_probs)
-
+    print(f"ratio mean {ratio.mean()}")
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1 - epsilon_low, 1 + epsilon_high) * advantages
     surrogate_loss = torch.min(surr1, surr2)
     per_token_loss = surrogate_loss
+    if logger :
+        ent_per_token = -token_log_probs.detach()
+        ent_per_token = ent_per_token * completion_mask
+        seq_entropy = ent_per_token.sum(dim=1) / (completion_mask.sum(dim=1) + 1e-12)
+        avg_entropy = seq_entropy.mean().item()
+        covs = (token_log_probs - token_log_probs.mean()) * (advantages - advantages.mean())
+        logger.log_metrics({
+            "avg_entropy" : avg_entropy,
+            "cov_mean": {covs.mean().item()},
+            "covs_std": {covs.std().item()},
+        })
+        
     loss = -torch.clamp(torch.nan_to_num(((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)), 0, 0,
-                             0), min=-10, max=10).mean()
+                             0), min=-15, max=15).mean()
+    return loss
+
+
+def grpo_loss_clip_cov(model, rollout_data, processor, reward_function, epsilon_high=0.2, epsilon_low=0.2, top_samples=None, logger=None):
+    """
+    Computes the GRPO loss for updating the policy model.
+    """
+    cov_lb = 1
+    cov_hb = 5
+    select_ratio = 2e-4
+
+    device = model.device
+    input_ids = rollout_data["input_ids"]
+    point_cloud = rollout_data["point_cloud"]
+    attention_mask = rollout_data["attention_mask"]
+    completion_mask = rollout_data["completion_mask"]
+    logits_to_keep = rollout_data["logits_to_keep"]
+    old_log_probs = rollout_data["old_log_probs"]
+    advantages = rollout_data["advantages"]
+    is_pc = rollout_data["is_pc"]
+    is_img = rollout_data["is_img"]
+    pixel_values_videos = rollout_data["pixel_values_videos"]
+    video_grid_thw = rollout_data["video_grid_thw"]
+    token_log_probs = compute_log_probs(model, (input_ids.clone(), attention_mask.clone(), point_cloud.clone(), is_pc.clone(), is_img.clone(), pixel_values_videos, video_grid_thw), logits_to_keep)
+    ratio = torch.exp(token_log_probs - old_log_probs)
+
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - epsilon_low, 1 + epsilon_high) * advantages
+
+    ### detach top covariance tokens
+    covs = (token_log_probs - token_log_probs.mean()) * (advantages - advantages.mean())
+    mask = (covs > cov_lb) & (covs < cov_hb)
+    all_idx = torch.nonzero(mask).reshape(-1)
+    select_num = int(select_ratio * token_log_probs.numel())
+
+    if all_idx.numel() >= select_num > 0:
+        perm= torch.randperm(all_idx.numel(), device=all_idx.device)
+        clip_idx = all_idx[perm[:select_num]]
+        surr1[clip_idx] = surr1[clip_idx].detach()
+        surr2[clip_idx] = surr2[clip_idx].detach()
+
+    
+    surrogate_loss = torch.min(surr1, surr2)
+
+
+    per_token_loss = surrogate_loss
+
+    if logger :
+        ent_per_token = -token_log_probs.detach()
+        ent_per_token = ent_per_token * completion_mask
+        seq_entropy = ent_per_token.sum(dim=1) / (completion_mask.sum(dim=1) + 1e-12)
+        avg_entropy = seq_entropy.mean().item()
+        logger.log_metrics({
+            "avg_entropy" : avg_entropy,
+            "cov_mean": covs.mean().item(),
+            "covs_std": covs.std().item(),
+            "select_num" : select_num
+        })
+
+        
+    loss = -torch.clamp(torch.nan_to_num(((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)), 0, 0,
+                             0), min=-15, max=15).mean()
     return loss
 
 
@@ -268,6 +342,7 @@ def gspo_loss(model, rollout_data, processor, reward_function, epsilon_high=0.2,
     pixel_values_videos = rollout_data["pixel_values_videos"]
     video_grid_thw = rollout_data["video_grid_thw"]
     token_log_probs = compute_log_probs(model, (input_ids.clone(), attention_mask.clone(), point_cloud.clone(), is_pc.clone(), is_img.clone(), pixel_values_videos, video_grid_thw), logits_to_keep)
+
     log_ratio = token_log_probs - old_log_probs
     log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1)
     log_importance_weights = log_importance_weights.unsqueeze(-1)
@@ -279,7 +354,7 @@ def gspo_loss(model, rollout_data, processor, reward_function, epsilon_high=0.2,
     surrogate_loss = torch.min(surr1, surr2)
     per_token_loss = surrogate_loss
     loss = -torch.clamp(torch.nan_to_num(((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)), 0, 0,
-                             0), min=-10, max=10).mean()
+                             0), min=-15, max=15).mean()
     return loss
     
 
